@@ -1,0 +1,10 @@
+# Original Windows binaries (not needed for Linux version)
+*.exe
+*.dll
+
+# Python
+__pycache__/
+*.pyc
+
+# Archives
+*.zip
