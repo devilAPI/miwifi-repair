@@ -79,6 +79,106 @@ def flush_arp(ip):
     subprocess.run(["ip", "neigh", "flush", "to", ip], capture_output=True)
 
 
+def stop_network_manager(iface):
+    """Stop NetworkManager/systemd-networkd from interfering with the interface."""
+    actions = []
+
+    # Tell NetworkManager to leave this interface alone
+    r = subprocess.run(
+        ["nmcli", "device", "set", iface, "managed", "no"],
+        capture_output=True,
+    )
+    if r.returncode == 0:
+        actions.append("nmcli_unmanaged")
+        print(f"  Told NetworkManager to ignore {iface}")
+
+    # Kill any DHCP client running on the interface
+    for client in ["dhclient", "dhcpcd"]:
+        subprocess.run(["pkill", "-f", f"{client}.*{iface}"], capture_output=True)
+
+    # Stop systemd-networkd from reconfiguring the interface
+    r = subprocess.run(
+        ["networkctl", "forgo", iface],
+        capture_output=True,
+    )
+    if r.returncode == 0:
+        actions.append("networkctl_forgo")
+        print(f"  Told systemd-networkd to ignore {iface}")
+
+    return actions
+
+
+def restore_network_manager(iface, actions):
+    """Re-enable NetworkManager/systemd-networkd management of the interface."""
+    if "nmcli_unmanaged" in actions:
+        subprocess.run(
+            ["nmcli", "device", "set", iface, "managed", "yes"],
+            capture_output=True,
+        )
+        print(f"  Returned {iface} to NetworkManager")
+    if "networkctl_forgo" in actions:
+        subprocess.run(
+            ["networkctl", "reconfigure", iface],
+            capture_output=True,
+        )
+
+
+def open_firewall_ports():
+    """Add firewall exceptions for DHCP and TFTP. Returns cleanup info."""
+    rules = []
+
+    # Try iptables
+    for port, proto in [(67, "udp"), (68, "udp"), (69, "udp")]:
+        r = subprocess.run(
+            ["iptables", "-I", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            rules.append(("iptables", port, proto))
+
+    if rules:
+        print(f"  Opened firewall ports (iptables): 67, 68, 69/udp")
+        return rules
+
+    # Try nftables directly
+    r = subprocess.run(
+        ["nft", "add", "table", "inet", "miwifi_repair"],
+        capture_output=True,
+    )
+    if r.returncode == 0:
+        subprocess.run(
+            ["nft", "add", "chain", "inet", "miwifi_repair", "input",
+             "{ type filter hook input priority -10 ; policy accept ; }"],
+            capture_output=True,
+        )
+        for port in [67, 68, 69]:
+            subprocess.run(
+                ["nft", "add", "rule", "inet", "miwifi_repair", "input",
+                 "udp", "dport", str(port), "accept"],
+                capture_output=True,
+            )
+        rules.append(("nftables",))
+        print(f"  Opened firewall ports (nftables): 67, 68, 69/udp")
+
+    return rules
+
+
+def close_firewall_ports(rules):
+    """Remove the firewall exceptions we added."""
+    for rule in rules:
+        if rule[0] == "iptables":
+            _, port, proto = rule
+            subprocess.run(
+                ["iptables", "-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+                capture_output=True,
+            )
+        elif rule[0] == "nftables":
+            subprocess.run(
+                ["nft", "delete", "table", "inet", "miwifi_repair"],
+                capture_output=True,
+            )
+
+
 class DHCPServer(threading.Thread):
     """Minimal DHCP/BOOTP server that hands the router a known IP and
     points it at our TFTP server + boot filename."""
@@ -425,6 +525,11 @@ def main():
     print("  5. Release RESET and wait for the firmware transfer")
     print()
 
+    print("Preparing network...")
+    nm_actions = stop_network_manager(iface)
+    fw_rules = open_firewall_ports()
+    time.sleep(1)
+
     configure_interface(iface, args.server_ip, SUBNET_MASK)
     flush_arp(args.router_ip)
 
@@ -435,7 +540,9 @@ def main():
         print("\nShutting down...")
         dhcp.stop()
         tftp.stop()
+        close_firewall_ports(fw_rules)
         if not args.no_restore:
+            restore_network_manager(iface, nm_actions)
             restore_interface(iface)
         sys.exit(0)
 
