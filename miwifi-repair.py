@@ -15,6 +15,7 @@ The router must be in recovery mode (hold reset while powering on).
 """
 
 import argparse
+import atexit
 import ipaddress
 import os
 import platform
@@ -37,6 +38,19 @@ DHCP_CLIENT_PORT = 68
 TFTP_BLOCK_SIZE = 512
 TFTP_TIMEOUT = 5
 TFTP_MAX_RETRIES = 20
+
+
+def _run(args, check=False, **kwargs):
+    """Run a subprocess, printing stderr on failure when check=True."""
+    r = subprocess.run(args, capture_output=True, **kwargs)
+    if check and r.returncode != 0:
+        cmd = " ".join(args)
+        err = r.stderr.decode(errors="replace").strip()
+        msg = f"Command failed: {cmd}"
+        if err:
+            msg += f"\n  {err}"
+        raise RuntimeError(msg)
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -69,42 +83,21 @@ def configure_interface(iface, ip, mask):
     prefix_len = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
 
     if PLATFORM == "Linux":
-        subprocess.run(
-            ["ip", "addr", "flush", "dev", iface],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["ip", "addr", "add", f"{ip}/{prefix_len}", "dev", iface],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["ip", "link", "set", iface, "up"],
-            check=True, capture_output=True,
-        )
+        _run(["ip", "addr", "flush", "dev", iface], check=True)
+        _run(["ip", "addr", "add", f"{ip}/{prefix_len}", "dev", iface], check=True)
+        _run(["ip", "link", "set", iface, "up"], check=True)
     elif PLATFORM == "Darwin":
-        subprocess.run(
-            ["ifconfig", iface, "inet", ip, "netmask", mask],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["ifconfig", iface, "up"],
-            check=True, capture_output=True,
-        )
+        _run(["ifconfig", iface, "inet", ip, "netmask", mask], check=True)
+        _run(["ifconfig", iface, "up"], check=True)
     elif PLATFORM == "Windows":
-        subprocess.run(
-            ["netsh", "interface", "ip", "set", "address",
-             f"name={iface}", "static", ip, mask],
-            check=True, capture_output=True,
-        )
+        _run(["netsh", "interface", "ip", "set", "address",
+              f"name={iface}", "static", ip, mask], check=True)
 
 
 def restore_interface(iface):
-    print(f"\nRestoring {iface} to DHCP...")
+    print(f"  Restoring {iface} to DHCP...")
     if PLATFORM == "Linux":
-        subprocess.run(
-            ["ip", "addr", "flush", "dev", iface],
-            capture_output=True,
-        )
+        _run(["ip", "addr", "flush", "dev", iface])
         for cmd in [
             ["dhclient", iface],
             ["dhcpcd", iface],
@@ -116,16 +109,10 @@ def restore_interface(iface):
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
     elif PLATFORM == "Darwin":
-        subprocess.run(
-            ["ipconfig", "set", iface, "DHCP"],
-            capture_output=True,
-        )
+        _run(["ipconfig", "set", iface, "DHCP"])
     elif PLATFORM == "Windows":
-        subprocess.run(
-            ["netsh", "interface", "ip", "set", "address",
-             f"name={iface}", "dhcp"],
-            capture_output=True,
-        )
+        _run(["netsh", "interface", "ip", "set", "address",
+              f"name={iface}", "dhcp"])
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +121,9 @@ def restore_interface(iface):
 
 def flush_arp(ip):
     if PLATFORM == "Linux":
-        subprocess.run(["ip", "neigh", "flush", "to", ip], capture_output=True)
-    elif PLATFORM == "Darwin":
-        subprocess.run(["arp", "-d", ip], capture_output=True)
-    elif PLATFORM == "Windows":
-        subprocess.run(["arp", "-d", ip], capture_output=True)
+        _run(["ip", "neigh", "flush", "to", ip])
+    else:
+        _run(["arp", "-d", ip])
 
 
 # ---------------------------------------------------------------------------
@@ -151,21 +136,15 @@ def stop_network_manager(iface):
 
     actions = []
 
-    r = subprocess.run(
-        ["nmcli", "device", "set", iface, "managed", "no"],
-        capture_output=True,
-    )
+    r = _run(["nmcli", "device", "set", iface, "managed", "no"])
     if r.returncode == 0:
         actions.append("nmcli_unmanaged")
         print(f"  Told NetworkManager to ignore {iface}")
 
     for client in ["dhclient", "dhcpcd"]:
-        subprocess.run(["pkill", "-f", f"{client}.*{iface}"], capture_output=True)
+        _run(["pkill", "-f", f"{client}.*{iface}"])
 
-    r = subprocess.run(
-        ["networkctl", "forgo", iface],
-        capture_output=True,
-    )
+    r = _run(["networkctl", "forgo", iface])
     if r.returncode == 0:
         actions.append("networkctl_forgo")
         print(f"  Told systemd-networkd to ignore {iface}")
@@ -175,16 +154,10 @@ def stop_network_manager(iface):
 
 def restore_network_manager(iface, actions):
     if "nmcli_unmanaged" in actions:
-        subprocess.run(
-            ["nmcli", "device", "set", iface, "managed", "yes"],
-            capture_output=True,
-        )
+        _run(["nmcli", "device", "set", iface, "managed", "yes"])
         print(f"  Returned {iface} to NetworkManager")
     if "networkctl_forgo" in actions:
-        subprocess.run(
-            ["networkctl", "reconfigure", iface],
-            capture_output=True,
-        )
+        _run(["networkctl", "reconfigure", iface])
 
 
 # ---------------------------------------------------------------------------
@@ -196,35 +169,24 @@ def open_firewall_ports(iface=None):
 
     if PLATFORM == "Linux":
         for port, proto in [(67, "udp"), (68, "udp"), (69, "udp")]:
-            r = subprocess.run(
-                ["iptables", "-I", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
-                capture_output=True,
-            )
+            r = _run(["iptables", "-I", "INPUT", "-p", proto,
+                       "--dport", str(port), "-j", "ACCEPT"])
             if r.returncode == 0:
                 rules.append(("iptables", port, proto))
 
         if rules:
-            print(f"  Opened firewall ports (iptables): 67, 68, 69/udp")
+            print("  Opened firewall ports (iptables): 67, 68, 69/udp")
             return rules
 
-        r = subprocess.run(
-            ["nft", "add", "table", "inet", "miwifi_repair"],
-            capture_output=True,
-        )
+        r = _run(["nft", "add", "table", "inet", "miwifi_repair"])
         if r.returncode == 0:
-            subprocess.run(
-                ["nft", "add", "chain", "inet", "miwifi_repair", "input",
-                 "{ type filter hook input priority -10 ; policy accept ; }"],
-                capture_output=True,
-            )
+            _run(["nft", "add", "chain", "inet", "miwifi_repair", "input",
+                  "{ type filter hook input priority -10 ; policy accept ; }"])
             for port in [67, 68, 69]:
-                subprocess.run(
-                    ["nft", "add", "rule", "inet", "miwifi_repair", "input",
-                     "udp", "dport", str(port), "accept"],
-                    capture_output=True,
-                )
+                _run(["nft", "add", "rule", "inet", "miwifi_repair", "input",
+                      "udp", "dport", str(port), "accept"])
             rules.append(("nftables",))
-            print(f"  Opened firewall ports (nftables): 67, 68, 69/udp")
+            print("  Opened firewall ports (nftables): 67, 68, 69/udp")
 
     elif PLATFORM == "Darwin":
         anchor = "com.miwifi-repair"
@@ -235,29 +197,24 @@ def open_firewall_ports(iface=None):
         )
         anchor_file = "/tmp/miwifi_repair_pf.conf"
         try:
-            with open(anchor_file, "w") as f:
+            fd = os.open(anchor_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(pf_rules)
-            subprocess.run(
-                ["pfctl", "-a", anchor, "-f", anchor_file],
-                capture_output=True,
-            )
-            subprocess.run(["pfctl", "-e"], capture_output=True)
+            _run(["pfctl", "-a", anchor, "-f", anchor_file])
+            _run(["pfctl", "-e"])
             rules.append(("pf", anchor, anchor_file))
-            print(f"  Opened firewall ports (pf): 67, 68, 69/udp")
+            print("  Opened firewall ports (pf): 67, 68, 69/udp")
         except OSError:
             pass
 
     elif PLATFORM == "Windows":
         rule_name = "MIWIFIRepair_DHCP_TFTP"
-        r = subprocess.run(
-            ["netsh", "advfirewall", "firewall", "add", "rule",
-             f"name={rule_name}", "dir=in", "action=allow",
-             "protocol=UDP", "localport=67,68,69"],
-            capture_output=True,
-        )
+        r = _run(["netsh", "advfirewall", "firewall", "add", "rule",
+                   f"name={rule_name}", "dir=in", "action=allow",
+                   "protocol=UDP", "localport=67,68,69"])
         if r.returncode == 0:
             rules.append(("netsh", rule_name))
-            print(f"  Opened firewall ports (Windows Firewall): 67, 68, 69/udp")
+            print("  Opened firewall ports (Windows Firewall): 67, 68, 69/udp")
 
     return rules
 
@@ -266,32 +223,21 @@ def close_firewall_ports(rules):
     for rule in rules:
         if rule[0] == "iptables":
             _, port, proto = rule
-            subprocess.run(
-                ["iptables", "-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
-                capture_output=True,
-            )
+            _run(["iptables", "-D", "INPUT", "-p", proto,
+                  "--dport", str(port), "-j", "ACCEPT"])
         elif rule[0] == "nftables":
-            subprocess.run(
-                ["nft", "delete", "table", "inet", "miwifi_repair"],
-                capture_output=True,
-            )
+            _run(["nft", "delete", "table", "inet", "miwifi_repair"])
         elif rule[0] == "pf":
             _, anchor, anchor_file = rule
-            subprocess.run(
-                ["pfctl", "-a", anchor, "-F", "all"],
-                capture_output=True,
-            )
+            _run(["pfctl", "-a", anchor, "-F", "all"])
             try:
                 os.unlink(anchor_file)
             except OSError:
                 pass
         elif rule[0] == "netsh":
             _, rule_name = rule
-            subprocess.run(
-                ["netsh", "advfirewall", "firewall", "delete", "rule",
-                 f"name={rule_name}"],
-                capture_output=True,
-            )
+            _run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                  f"name={rule_name}"])
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +271,6 @@ class DHCPServer(threading.Thread):
             )
         elif PLATFORM == "Windows":
             sock.bind((self.server_ip, DHCP_SERVER_PORT))
-        # macOS: bind to INADDR_ANY; with a single interface configured,
-        # broadcast replies reach the right segment.
 
         if PLATFORM != "Windows":
             sock.bind(("0.0.0.0", DHCP_SERVER_PORT))
@@ -370,7 +314,8 @@ class DHCPServer(threading.Thread):
 
         sock.close()
 
-    def _get_dhcp_msg_type(self, data):
+    @staticmethod
+    def _get_dhcp_msg_type(data):
         if len(data) <= 240:
             return 0
         if data[236:240] != b'\x63\x82\x53\x63':
@@ -386,7 +331,7 @@ class DHCPServer(threading.Thread):
             if i + 1 >= len(data):
                 break
             length = data[i + 1]
-            if opt == 53 and length >= 1:
+            if opt == 53 and length >= 1 and i + 2 < len(data):
                 return data[i + 2]
             i += 2 + length
         return 0
@@ -519,7 +464,8 @@ class TFTPServer(threading.Thread):
 
                     total_sent += len(chunk)
                     pct = min(100, total_sent * 100 // self.filesize) if self.filesize > 0 else 100
-                    speed = total_sent / (time.time() - start_time) if time.time() > start_time else 0
+                    elapsed = time.time() - start_time
+                    speed = total_sent / elapsed if elapsed > 0 else 0
                     print(
                         f"\r  Transfer: {pct}% "
                         f"({total_sent:,}/{self.filesize:,} bytes) "
@@ -529,10 +475,11 @@ class TFTPServer(threading.Thread):
 
                     if len(chunk) < TFTP_BLOCK_SIZE:
                         elapsed = time.time() - start_time
+                        speed = total_sent / elapsed if elapsed > 0 else 0
                         print(
                             f"\n  Transfer complete: {total_sent:,} bytes "
                             f"in {elapsed:.1f}s "
-                            f"({total_sent / elapsed / 1024:.0f} KB/s)"
+                            f"({speed / 1024:.0f} KB/s)"
                         )
                         self.transfer_complete.set()
                         return
@@ -554,12 +501,12 @@ class TFTPServer(threading.Thread):
 # Interface listing
 # ---------------------------------------------------------------------------
 
+_MACOS_VIRTUAL_PREFIXES = ("lo", "utun", "bridge", "awdl", "llw", "ap",
+                           "gif", "stf", "anpi", "XHC", "vmnet", "pktap")
+
 def list_interfaces():
     if PLATFORM == "Linux":
-        result = subprocess.run(
-            ["ip", "-o", "link", "show"],
-            capture_output=True, text=True,
-        )
+        result = _run(["ip", "-o", "link", "show"], text=True)
         ifaces = []
         for line in result.stdout.strip().splitlines():
             parts = line.split(": ")
@@ -570,20 +517,14 @@ def list_interfaces():
         return ifaces
 
     elif PLATFORM == "Darwin":
-        result = subprocess.run(
-            ["ifconfig", "-l"],
-            capture_output=True, text=True,
-        )
+        result = _run(["ifconfig", "-l"], text=True)
         return [
             i for i in result.stdout.strip().split()
-            if i != "lo0" and not i.startswith("utun")
+            if not i.startswith(_MACOS_VIRTUAL_PREFIXES)
         ]
 
     elif PLATFORM == "Windows":
-        result = subprocess.run(
-            ["netsh", "interface", "show", "interface"],
-            capture_output=True, text=True,
-        )
+        result = _run(["netsh", "interface", "show", "interface"], text=True)
         ifaces = []
         for line in result.stdout.strip().splitlines()[3:]:
             cols = line.split()
@@ -598,6 +539,8 @@ def list_interfaces():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+_cleanup_done = threading.Event()
 
 def main():
     platform_name = {"Linux": "Linux", "Darwin": "macOS", "Windows": "Windows"}.get(PLATFORM, PLATFORM)
@@ -632,6 +575,13 @@ def main():
         help="Don't restore network config on exit",
     )
     args = parser.parse_args()
+
+    for label, value in [("server-ip", args.server_ip), ("router-ip", args.router_ip)]:
+        try:
+            ipaddress.IPv4Address(value)
+        except ValueError:
+            print(f"Error: --{label} is not a valid IPv4 address: {value}")
+            sys.exit(1)
 
     check_root()
 
@@ -690,25 +640,42 @@ def main():
     fw_rules = open_firewall_ports(iface)
     time.sleep(1)
 
-    configure_interface(iface, args.server_ip, SUBNET_MASK)
-    flush_arp(args.router_ip)
+    dhcp = None
+    tftp = None
 
-    dhcp = DHCPServer(iface, args.server_ip, args.router_ip, os.path.basename(firmware))
-    tftp = TFTPServer(args.server_ip, firmware)
-
-    def cleanup(signum=None, frame=None):
+    def cleanup():
+        if _cleanup_done.is_set():
+            return
+        _cleanup_done.set()
         print("\nShutting down...")
-        dhcp.stop()
-        tftp.stop()
+        if dhcp:
+            dhcp.stop()
+        if tftp:
+            tftp.stop()
         close_firewall_ports(fw_rules)
         if not args.no_restore:
             restore_network_manager(iface, nm_actions)
             restore_interface(iface)
+
+    def signal_handler(signum, frame):
+        cleanup()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, cleanup)
+    atexit.register(cleanup)
+    signal.signal(signal.SIGINT, signal_handler)
     if PLATFORM != "Windows":
-        signal.signal(signal.SIGTERM, cleanup)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        configure_interface(iface, args.server_ip, SUBNET_MASK)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    flush_arp(args.router_ip)
+
+    dhcp = DHCPServer(iface, args.server_ip, args.router_ip, os.path.basename(firmware))
+    tftp = TFTPServer(args.server_ip, firmware)
 
     dhcp.start()
     tftp.start()
@@ -725,7 +692,6 @@ def main():
     print()
 
     time.sleep(5)
-    cleanup()
 
 
 if __name__ == "__main__":
