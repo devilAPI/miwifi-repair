@@ -6,7 +6,7 @@ Recovers/reflashes Xiaomi routers via TFTP+DHCP, replicating the
 functionality of MIWIFIRepairTool.x86.exe.
 
 Usage:
-  sudo ./miwifi-repair <firmware.bin> -i <interface>
+  sudo ./miwifi-repair.py <firmware.bin> -i <interface>
 
 The router must be in recovery mode (hold reset while powering on).
 """
