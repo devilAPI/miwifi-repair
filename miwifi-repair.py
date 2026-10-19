@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-MIWIFI Repair Tool for Linux
+MIWIFI Repair Tool
 
 Recovers/reflashes Xiaomi routers via TFTP+DHCP, replicating the
 functionality of MIWIFIRepairTool.x86.exe.
 
+Supports Linux, macOS, and Windows.
+
 Usage:
-  sudo ./miwifi-repair.py <firmware.bin> -i <interface>
+  sudo ./miwifi-repair.py <firmware.bin> -i <interface>       (Linux/macOS)
+  python miwifi-repair.py <firmware.bin> -i <interface>       (Windows, as admin)
 
 The router must be in recovery mode (hold reset while powering on).
 """
@@ -14,6 +17,7 @@ The router must be in recovery mode (hold reset while powering on).
 import argparse
 import ipaddress
 import os
+import platform
 import signal
 import socket
 import struct
@@ -21,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+
+PLATFORM = platform.system()  # "Linux", "Darwin", "Windows"
 
 ROUTER_IP = "192.168.31.1"
 SERVER_IP = "192.168.31.100"
@@ -33,57 +39,118 @@ TFTP_TIMEOUT = 5
 TFTP_MAX_RETRIES = 20
 
 
-def check_root():
-    if os.geteuid() != 0:
-        print("Error: this tool requires root privileges.")
-        print("Run with: sudo ./miwifi-repair ...")
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# Privilege check
+# ---------------------------------------------------------------------------
 
+def check_root():
+    if PLATFORM == "Windows":
+        try:
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                print("Error: this tool requires Administrator privileges.")
+                print("Right-click your terminal and choose 'Run as administrator'.")
+                sys.exit(1)
+        except AttributeError:
+            pass
+    else:
+        if os.geteuid() != 0:
+            print("Error: this tool requires root privileges.")
+            print("Run with: sudo ./miwifi-repair.py ...")
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Interface configuration
+# ---------------------------------------------------------------------------
 
 def configure_interface(iface, ip, mask):
     print(f"Configuring {iface} with {ip}/{mask}")
-    subprocess.run(
-        ["ip", "addr", "flush", "dev", iface],
-        check=True, capture_output=True,
-    )
     prefix_len = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
-    subprocess.run(
-        ["ip", "addr", "add", f"{ip}/{prefix_len}", "dev", iface],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["ip", "link", "set", iface, "up"],
-        check=True, capture_output=True,
-    )
+
+    if PLATFORM == "Linux":
+        subprocess.run(
+            ["ip", "addr", "flush", "dev", iface],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ip", "addr", "add", f"{ip}/{prefix_len}", "dev", iface],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ip", "link", "set", iface, "up"],
+            check=True, capture_output=True,
+        )
+    elif PLATFORM == "Darwin":
+        subprocess.run(
+            ["ifconfig", iface, "inet", ip, "netmask", mask],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ifconfig", iface, "up"],
+            check=True, capture_output=True,
+        )
+    elif PLATFORM == "Windows":
+        subprocess.run(
+            ["netsh", "interface", "ip", "set", "address",
+             f"name={iface}", "static", ip, mask],
+            check=True, capture_output=True,
+        )
 
 
 def restore_interface(iface):
     print(f"\nRestoring {iface} to DHCP...")
-    subprocess.run(
-        ["ip", "addr", "flush", "dev", iface],
-        capture_output=True,
-    )
-    for cmd in [
-        ["dhclient", iface],
-        ["dhcpcd", iface],
-        ["networkctl", "reconfigure", iface],
-    ]:
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=10)
-            break
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+    if PLATFORM == "Linux":
+        subprocess.run(
+            ["ip", "addr", "flush", "dev", iface],
+            capture_output=True,
+        )
+        for cmd in [
+            ["dhclient", iface],
+            ["dhcpcd", iface],
+            ["networkctl", "reconfigure", iface],
+        ]:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=10)
+                break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+    elif PLATFORM == "Darwin":
+        subprocess.run(
+            ["ipconfig", "set", iface, "DHCP"],
+            capture_output=True,
+        )
+    elif PLATFORM == "Windows":
+        subprocess.run(
+            ["netsh", "interface", "ip", "set", "address",
+             f"name={iface}", "dhcp"],
+            capture_output=True,
+        )
 
+
+# ---------------------------------------------------------------------------
+# ARP flush
+# ---------------------------------------------------------------------------
 
 def flush_arp(ip):
-    subprocess.run(["ip", "neigh", "flush", "to", ip], capture_output=True)
+    if PLATFORM == "Linux":
+        subprocess.run(["ip", "neigh", "flush", "to", ip], capture_output=True)
+    elif PLATFORM == "Darwin":
+        subprocess.run(["arp", "-d", ip], capture_output=True)
+    elif PLATFORM == "Windows":
+        subprocess.run(["arp", "-d", ip], capture_output=True)
 
+
+# ---------------------------------------------------------------------------
+# Network manager control (Linux-only, no-ops on other platforms)
+# ---------------------------------------------------------------------------
 
 def stop_network_manager(iface):
-    """Stop NetworkManager/systemd-networkd from interfering with the interface."""
+    if PLATFORM != "Linux":
+        return []
+
     actions = []
 
-    # Tell NetworkManager to leave this interface alone
     r = subprocess.run(
         ["nmcli", "device", "set", iface, "managed", "no"],
         capture_output=True,
@@ -92,11 +159,9 @@ def stop_network_manager(iface):
         actions.append("nmcli_unmanaged")
         print(f"  Told NetworkManager to ignore {iface}")
 
-    # Kill any DHCP client running on the interface
     for client in ["dhclient", "dhcpcd"]:
         subprocess.run(["pkill", "-f", f"{client}.*{iface}"], capture_output=True)
 
-    # Stop systemd-networkd from reconfiguring the interface
     r = subprocess.run(
         ["networkctl", "forgo", iface],
         capture_output=True,
@@ -109,7 +174,6 @@ def stop_network_manager(iface):
 
 
 def restore_network_manager(iface, actions):
-    """Re-enable NetworkManager/systemd-networkd management of the interface."""
     if "nmcli_unmanaged" in actions:
         subprocess.run(
             ["nmcli", "device", "set", iface, "managed", "yes"],
@@ -123,48 +187,82 @@ def restore_network_manager(iface, actions):
         )
 
 
-def open_firewall_ports():
-    """Add firewall exceptions for DHCP and TFTP. Returns cleanup info."""
+# ---------------------------------------------------------------------------
+# Firewall port management
+# ---------------------------------------------------------------------------
+
+def open_firewall_ports(iface=None):
     rules = []
 
-    # Try iptables
-    for port, proto in [(67, "udp"), (68, "udp"), (69, "udp")]:
+    if PLATFORM == "Linux":
+        for port, proto in [(67, "udp"), (68, "udp"), (69, "udp")]:
+            r = subprocess.run(
+                ["iptables", "-I", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                rules.append(("iptables", port, proto))
+
+        if rules:
+            print(f"  Opened firewall ports (iptables): 67, 68, 69/udp")
+            return rules
+
         r = subprocess.run(
-            ["iptables", "-I", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+            ["nft", "add", "table", "inet", "miwifi_repair"],
             capture_output=True,
         )
         if r.returncode == 0:
-            rules.append(("iptables", port, proto))
-
-    if rules:
-        print(f"  Opened firewall ports (iptables): 67, 68, 69/udp")
-        return rules
-
-    # Try nftables directly
-    r = subprocess.run(
-        ["nft", "add", "table", "inet", "miwifi_repair"],
-        capture_output=True,
-    )
-    if r.returncode == 0:
-        subprocess.run(
-            ["nft", "add", "chain", "inet", "miwifi_repair", "input",
-             "{ type filter hook input priority -10 ; policy accept ; }"],
-            capture_output=True,
-        )
-        for port in [67, 68, 69]:
             subprocess.run(
-                ["nft", "add", "rule", "inet", "miwifi_repair", "input",
-                 "udp", "dport", str(port), "accept"],
+                ["nft", "add", "chain", "inet", "miwifi_repair", "input",
+                 "{ type filter hook input priority -10 ; policy accept ; }"],
                 capture_output=True,
             )
-        rules.append(("nftables",))
-        print(f"  Opened firewall ports (nftables): 67, 68, 69/udp")
+            for port in [67, 68, 69]:
+                subprocess.run(
+                    ["nft", "add", "rule", "inet", "miwifi_repair", "input",
+                     "udp", "dport", str(port), "accept"],
+                    capture_output=True,
+                )
+            rules.append(("nftables",))
+            print(f"  Opened firewall ports (nftables): 67, 68, 69/udp")
+
+    elif PLATFORM == "Darwin":
+        anchor = "com.miwifi-repair"
+        pf_rules = (
+            f'pass in quick on {iface} proto udp from any to any port {{ 67, 68, 69 }}\n'
+            if iface else
+            'pass in quick proto udp from any to any port { 67, 68, 69 }\n'
+        )
+        anchor_file = "/tmp/miwifi_repair_pf.conf"
+        try:
+            with open(anchor_file, "w") as f:
+                f.write(pf_rules)
+            subprocess.run(
+                ["pfctl", "-a", anchor, "-f", anchor_file],
+                capture_output=True,
+            )
+            subprocess.run(["pfctl", "-e"], capture_output=True)
+            rules.append(("pf", anchor, anchor_file))
+            print(f"  Opened firewall ports (pf): 67, 68, 69/udp")
+        except OSError:
+            pass
+
+    elif PLATFORM == "Windows":
+        rule_name = "MIWIFIRepair_DHCP_TFTP"
+        r = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=allow",
+             "protocol=UDP", "localport=67,68,69"],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            rules.append(("netsh", rule_name))
+            print(f"  Opened firewall ports (Windows Firewall): 67, 68, 69/udp")
 
     return rules
 
 
 def close_firewall_ports(rules):
-    """Remove the firewall exceptions we added."""
     for rule in rules:
         if rule[0] == "iptables":
             _, port, proto = rule
@@ -177,7 +275,28 @@ def close_firewall_ports(rules):
                 ["nft", "delete", "table", "inet", "miwifi_repair"],
                 capture_output=True,
             )
+        elif rule[0] == "pf":
+            _, anchor, anchor_file = rule
+            subprocess.run(
+                ["pfctl", "-a", anchor, "-F", "all"],
+                capture_output=True,
+            )
+            try:
+                os.unlink(anchor_file)
+            except OSError:
+                pass
+        elif rule[0] == "netsh":
+            _, rule_name = rule
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule",
+                 f"name={rule_name}"],
+                capture_output=True,
+            )
 
+
+# ---------------------------------------------------------------------------
+# DHCP Server
+# ---------------------------------------------------------------------------
 
 class DHCPServer(threading.Thread):
     """Minimal DHCP/BOOTP server that hands the router a known IP and
@@ -199,11 +318,20 @@ class DHCPServer(threading.Thread):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(
-            socket.SOL_SOCKET, 25, self.iface.encode()  # SO_BINDTODEVICE
-        )
+
+        if PLATFORM == "Linux":
+            sock.setsockopt(
+                socket.SOL_SOCKET, 25, self.iface.encode()  # SO_BINDTODEVICE
+            )
+        elif PLATFORM == "Windows":
+            sock.bind((self.server_ip, DHCP_SERVER_PORT))
+        # macOS: bind to INADDR_ANY; with a single interface configured,
+        # broadcast replies reach the right segment.
+
+        if PLATFORM != "Windows":
+            sock.bind(("0.0.0.0", DHCP_SERVER_PORT))
+
         sock.settimeout(1)
-        sock.bind(("0.0.0.0", DHCP_SERVER_PORT))
         print(f"DHCP server listening on {self.iface}:{DHCP_SERVER_PORT}")
 
         while self.running:
@@ -225,7 +353,6 @@ class DHCPServer(threading.Thread):
             client_mac = data[28:34]
             mac_str = ":".join(f"{b:02x}" for b in client_mac)
 
-            # Parse DHCP options to find message type
             msg_type = self._get_dhcp_msg_type(data)
             msg_name = {1: "DISCOVER", 3: "REQUEST"}.get(msg_type, f"type={msg_type}")
             print(f"DHCP {msg_name} from {mac_str}")
@@ -246,7 +373,6 @@ class DHCPServer(threading.Thread):
     def _get_dhcp_msg_type(self, data):
         if len(data) <= 240:
             return 0
-        # Check magic cookie
         if data[236:240] != b'\x63\x82\x53\x63':
             return 0
         i = 240
@@ -269,7 +395,6 @@ class DHCPServer(threading.Thread):
         server_ip = socket.inet_aton(self.server_ip)
         your_ip = socket.inet_aton(self.router_ip)
 
-        # BOOTP header
         pkt = bytearray(300)
         pkt[0] = 2  # BOOTREPLY
         pkt[1] = 1  # Ethernet
@@ -280,36 +405,29 @@ class DHCPServer(threading.Thread):
         pkt[20:24] = server_ip    # siaddr (TFTP server)
         pkt[28:34] = client_mac
 
-        # Boot filename (null-terminated, 128 bytes at offset 108)
         boot_bytes = self.boot_file.encode("ascii")[:127]
         pkt[108:108 + len(boot_bytes)] = boot_bytes
 
-        # DHCP magic cookie
         pkt[236:240] = b'\x63\x82\x53\x63'
 
-        # DHCP options
         opts = bytearray()
-        # Message type: OFFER (2) or ACK (5)
         reply_type = 2 if request_type == 1 else 5
         opts += bytes([53, 1, reply_type])
-        # Server identifier
         opts += bytes([54, 4]) + server_ip
-        # Subnet mask
         opts += bytes([1, 4]) + socket.inet_aton(SUBNET_MASK)
-        # Router/gateway
         opts += bytes([3, 4]) + server_ip
-        # Lease time (1 hour)
         opts += bytes([51, 4]) + struct.pack("!I", 3600)
-        # TFTP server name
         opts += bytes([66, 4]) + server_ip
-        # Boot filename
         opts += bytes([67, len(boot_bytes)]) + boot_bytes
-        # End
         opts += bytes([255])
 
         pkt[240:240 + len(opts)] = opts
         return bytes(pkt[:240 + len(opts)])
 
+
+# ---------------------------------------------------------------------------
+# TFTP Server
+# ---------------------------------------------------------------------------
 
 class TFTPServer(threading.Thread):
     """Minimal TFTP server that serves exactly one file."""
@@ -373,7 +491,7 @@ class TFTPServer(threading.Thread):
                 while self.running:
                     chunk = f.read(TFTP_BLOCK_SIZE)
 
-                    pkt = struct.pack("!HH", 3, block) + chunk  # DATA opcode=3
+                    pkt = struct.pack("!HH", 3, block) + chunk
                     retries = 0
 
                     while retries < TFTP_MAX_RETRIES and self.running:
@@ -432,28 +550,64 @@ class TFTPServer(threading.Thread):
         sock.sendto(pkt, addr)
 
 
-def list_interfaces():
-    result = subprocess.run(
-        ["ip", "-o", "link", "show"],
-        capture_output=True, text=True,
-    )
-    ifaces = []
-    for line in result.stdout.strip().splitlines():
-        parts = line.split(": ")
-        if len(parts) >= 2:
-            name = parts[1].split("@")[0]
-            if name != "lo":
-                ifaces.append(name)
-    return ifaces
+# ---------------------------------------------------------------------------
+# Interface listing
+# ---------------------------------------------------------------------------
 
+def list_interfaces():
+    if PLATFORM == "Linux":
+        result = subprocess.run(
+            ["ip", "-o", "link", "show"],
+            capture_output=True, text=True,
+        )
+        ifaces = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(": ")
+            if len(parts) >= 2:
+                name = parts[1].split("@")[0]
+                if name != "lo":
+                    ifaces.append(name)
+        return ifaces
+
+    elif PLATFORM == "Darwin":
+        result = subprocess.run(
+            ["ifconfig", "-l"],
+            capture_output=True, text=True,
+        )
+        return [
+            i for i in result.stdout.strip().split()
+            if i != "lo0" and not i.startswith("utun")
+        ]
+
+    elif PLATFORM == "Windows":
+        result = subprocess.run(
+            ["netsh", "interface", "show", "interface"],
+            capture_output=True, text=True,
+        )
+        ifaces = []
+        for line in result.stdout.strip().splitlines()[3:]:
+            cols = line.split()
+            if len(cols) >= 4:
+                name = " ".join(cols[3:])
+                ifaces.append(name)
+        return ifaces
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
+    platform_name = {"Linux": "Linux", "Darwin": "macOS", "Windows": "Windows"}.get(PLATFORM, PLATFORM)
+
     parser = argparse.ArgumentParser(
-        description="MIWIFI Repair Tool for Linux — flash Xiaomi router firmware via TFTP",
+        description=f"MIWIFI Repair Tool for {platform_name} — flash Xiaomi router firmware via TFTP",
         epilog=(
             "Steps:\n"
             "  1. Connect your PC to the router via Ethernet\n"
-            "  2. Run: sudo ./miwifi-repair firmware.bin -i eth0\n"
+            "  2. Run: sudo ./miwifi-repair.py firmware.bin -i eth0\n"
             "  3. Hold the reset button and power on the router\n"
             "  4. Wait for the transfer to complete (~2-5 minutes)\n"
             "  5. The router will reboot with the new firmware"
@@ -463,7 +617,7 @@ def main():
     parser.add_argument("firmware", help="Path to the firmware .bin file")
     parser.add_argument(
         "-i", "--interface",
-        help="Network interface connected to the router (e.g., eth0, enp3s0)",
+        help="Network interface connected to the router (e.g., eth0, enp3s0, en0, Ethernet)",
     )
     parser.add_argument(
         "--server-ip", default=SERVER_IP,
@@ -497,19 +651,25 @@ def main():
         if not ifaces:
             print("Error: no network interfaces found")
             sys.exit(1)
-        # Prefer ethernet-looking names
-        eth = [i for i in ifaces if i.startswith(("eth", "enp", "eno", "ens"))]
+        if PLATFORM == "Linux":
+            eth = [i for i in ifaces if i.startswith(("eth", "enp", "eno", "ens"))]
+        elif PLATFORM == "Darwin":
+            eth = [i for i in ifaces if i.startswith("en")]
+        elif PLATFORM == "Windows":
+            eth = [i for i in ifaces if "ethernet" in i.lower() or "local area" in i.lower()]
+        else:
+            eth = []
         if len(eth) == 1:
             iface = eth[0]
         else:
             print("Available interfaces:")
             for i in (eth or ifaces):
                 print(f"  {i}")
-            print("\nSpecify one with -i, e.g.: sudo ./miwifi-repair firmware.bin -i", (eth or ifaces)[0])
+            print("\nSpecify one with -i, e.g.:", sys.argv[0], "firmware.bin -i", (eth or ifaces)[0])
             sys.exit(1)
 
     print("=" * 60)
-    print("  MIWIFI Repair Tool for Linux")
+    print(f"  MIWIFI Repair Tool for {platform_name}")
     print("=" * 60)
     print(f"  Firmware : {os.path.basename(firmware)} ({filesize:,} bytes)")
     print(f"  Interface: {iface}")
@@ -527,7 +687,7 @@ def main():
 
     print("Preparing network...")
     nm_actions = stop_network_manager(iface)
-    fw_rules = open_firewall_ports()
+    fw_rules = open_firewall_ports(iface)
     time.sleep(1)
 
     configure_interface(iface, args.server_ip, SUBNET_MASK)
@@ -547,7 +707,8 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
+    if PLATFORM != "Windows":
+        signal.signal(signal.SIGTERM, cleanup)
 
     dhcp.start()
     tftp.start()
@@ -563,7 +724,6 @@ def main():
     print("This may take 2-5 minutes. Do NOT power off the router.")
     print()
 
-    # Wait a bit before restoring network
     time.sleep(5)
     cleanup()
 

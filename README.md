@@ -1,6 +1,6 @@
 # miwifi-repair
 
-Linux CLI tool for flashing/recovering Xiaomi (Mi) routers via TFTP — a reverse-engineered replacement for the Windows-only `MIWIFIRepairTool.exe`.
+Cross-platform CLI tool for flashing/recovering Xiaomi (Mi) routers via TFTP — a reverse-engineered replacement for the Windows-only `MIWIFIRepairTool.exe`. Supports Linux, macOS, and Windows.
 
 ## What it does
 
@@ -11,18 +11,29 @@ When a Xiaomi router is in recovery mode, it requests firmware over TFTP. This t
 3. Serves the firmware file over TFTP
 4. Restores your network config on exit
 
-No dependencies beyond Python 3 and the `ip` command.
+No dependencies beyond Python 3.
 
 ## Usage
 
 ```bash
-sudo ./miwifi-repair <firmware.bin> -i <interface>
+# Linux / macOS
+sudo ./miwifi-repair.py <firmware.bin> -i <interface>
+
+# Windows (run terminal as Administrator)
+python miwifi-repair.py <firmware.bin> -i <interface>
 ```
 
-### Example
+### Examples
 
 ```bash
-sudo ./miwifi-repair miwifi_r4ac_all_c4b35_2.18.28.bin -i enp0s31f6
+# Linux
+sudo ./miwifi-repair.py miwifi_r4ac_all_c4b35_2.18.28.bin -i enp0s31f6
+
+# macOS
+sudo ./miwifi-repair.py miwifi_r4ac_all_c4b35_2.18.28.bin -i en0
+
+# Windows
+python miwifi-repair.py miwifi_r4ac_all_c4b35_2.18.28.bin -i Ethernet
 ```
 
 ### Options
@@ -50,7 +61,7 @@ Should work with any Xiaomi router that supports TFTP recovery (most models do).
 
 ## Background
 
-The original `MIWIFIRepairTool.x86.exe` is a Windows GUI app built on TFTPD32 v4.61 with libcurl. It was reverse-engineered via static analysis (string extraction, API/protocol identification) and reimplemented as a pure Python CLI for Linux.
+The original `MIWIFIRepairTool.x86.exe` is a Windows GUI app built on TFTPD32 v4.61 with libcurl. It was reverse-engineered via static analysis (string extraction, API/protocol identification) and reimplemented as a pure Python CLI.
 
 ## License
 
